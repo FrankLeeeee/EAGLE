@@ -531,26 +531,25 @@ class Model(nn.Module):
                     "input_ids": [],
                     "loss_mask": []
                 }
-                for i in range(len(examples['id'])):
+                for i in range(len(examples['conversations'])):
                     messages = [
                         {"role": "system",
                          "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
                     ]
                     convroles = ["user", "assistant"]
-                    roles = {"human": "user", "gpt": "assistant"}
                     source = examples['conversations'][i]
                     if not source:
                         continue
-                    if roles[source[0]["from"]] != "user":
+                    if source[0]["role"] != "user":
                         # Skip the first one if it is not from human
                         source = source[1:]
                     for j, sentence in enumerate(source):
-                        role = roles[sentence["from"]]
+                        role = sentence["role"]
                         assert role == convroles[j % 2], f"{i}"
                         # if sentence["from"]=="gpt":
                         #     sentence["value"]=" "+sentence["value"]
                         messages.append(
-                            {"role": role, "content": sentence["value"]}
+                            {"role": role, "content": sentence["content"]}
                         )
                     conversation = tokenizer.apply_chat_template(
                         messages,
