@@ -25,7 +25,6 @@ train_config = {
     "config_path": "config.json",
 }
 
-from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
@@ -206,34 +205,42 @@ testdataset = build_dataset_rank(tokenizer, args.testpath)
 config = EConfig.from_pretrained(train_config["config_path"])
 model = Model(config, path=args.basepath, load_emb=True, load_head=True)
 model.scandata(args.trainpath, args.basepath)
+model = model.cuda()
+
 
 
 criterion = nn.SmoothL1Loss(reduction="none")
 
 num_epochs = train_config["num_epochs"]
 
-model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
-                                                     model=model,
-                                                     model_parameters=model.parameters(),
-                                                     )
+# model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
+#                                                      model=model,
+#                                                      model_parameters=model.parameters(),
+#                                                      )
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-global_rank = deepspeed.comm.get_rank()
-rank = deepspeed.comm.get_local_rank()
-world_size = deepspeed.comm.get_world_size()
-if global_rank == 0:
-    import wandb
+# global_rank = deepspeed.comm.get_rank()
+# rank = deepspeed.comm.get_local_rank()
+# world_size = deepspeed.comm.get_world_size()
+# if global_rank == 0:
+import wandb
 
-    wandb.login(key="")
-    wandb.init(project="l382", entity="yuhui-li", config=ds_config)
+wandb.login(key="")
+wandb.init(project="eagle-llama3-sample", config=ds_config)
 
 os.makedirs(args.savedir, exist_ok=True)
 
-sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=global_rank, shuffle=False)
-test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=4, pin_memory=True,
+# sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=global_rank, shuffle=False)
+# test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=4, pin_memory=True,
+#                          collate_fn=DataCollatorWithPadding())
+test_loader = DataLoader(testdataset, batch_size=train_config["bs"], num_workers=0, pin_memory=True,
                          collate_fn=DataCollatorWithPadding())
 
-train_sampler = DistributedSampler(traindataset, num_replicas=world_size, rank=global_rank, shuffle=True)
-train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=train_sampler, num_workers=4,
+# train_sampler = DistributedSampler(traindataset, num_replicas=world_size, rank=global_rank, shuffle=True)
+# train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=train_sampler, num_workers=4,
+#                           pin_memory=True,
+#                           collate_fn=DataCollatorWithPadding())
+train_loader = DataLoader(traindataset, batch_size=train_config["bs"], num_workers=0,
                           pin_memory=True,
                           collate_fn=DataCollatorWithPadding())
 
@@ -254,14 +261,14 @@ def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
 
 
 checkpoint_path, start_epoch = find_max_state_with_file(args.savedir)
-if checkpoint_path:
-    print(f"load from {checkpoint_path}")
-    model_engine.load_checkpoint(checkpoint_path)
+# if checkpoint_path:
+#     print(f"load from {checkpoint_path}")
+#     model_engine.load_checkpoint(checkpoint_path)
 
 
 
 for epoch in range(start_epoch, num_epochs):
-    train_sampler.set_epoch(epoch+1)
+    # train_sampler.set_epoch(epoch+1)
     print(f"Now training epoch {epoch}")
 
     model.train()
@@ -273,75 +280,84 @@ for epoch in range(start_epoch, num_epochs):
 
         model.zero_grad()
 
-        plosses, vlosses, acces = model_engine(input_ids=data["input_ids"].to(rank),
-                                               attention_mask=data["attention_mask"].to(rank),
-                                               loss_mask=data["loss_mask"],
-                                               )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            plosses, vlosses, acces = model(input_ids=data["input_ids"].cuda(),
+                                                attention_mask=data["attention_mask"].cuda(),
+                                                loss_mask=data["loss_mask"],
+                                                )
 
         ploss_weight = [0.8 ** i for i in range(len(plosses))]
         ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
         loss = ploss
-        model_engine.backward(loss)
+        
+        # model_engine.backward(loss)
+        loss.backward()
+        
 
 
-        model_engine.step()
+        # model_engine.step()
+        optimizer.step()
 
-        if global_rank == 0:
-            logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"]}
-            for i in range(len(plosses)):
-                logdict[f"train/ploss_{i}"] = plosses[i].item()
-            for i in range(len(acces)):
-                logdict[f"train/acc_{i}"] = acces[i]
-            wandb.log(logdict)
+        # if global_rank == 0:
+        logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
+        for i in range(len(plosses)):
+            logdict[f"train/ploss_{i}"] = plosses[i].item()
+        for i in range(len(acces)):
+            logdict[f"train/acc_{i}"] = acces[i]
+        wandb.log(logdict)
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
 
     for i in range(len(epoch_acces)):
         acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
-        deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
+        # deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
-        if global_rank == 0:
-            wandb.log({f"train/epochacc_{i}": acc_i})
-            print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
+        # if global_rank == 0:
+        wandb.log({f"train/epochacc_{i}": acc_i})
+        print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
 
     for i in range(len(epoch_plosses)):
         loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
-        deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
+        # deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
         loss_i = loss_i.item()
-        if global_rank == 0:
-            wandb.log({f"train/epochploss_{i}": loss_i})
-            print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
+        # if global_rank == 0:
+        wandb.log({f"train/epochploss_{i}": loss_i})
+        print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
 
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
 
     for batch_idx, data in enumerate(tqdm(test_loader)):
         with torch.no_grad():
-            plosses, vlosses, acces = model_engine(input_ids=data["input_ids"].to(rank),
-                                                   attention_mask=data["attention_mask"].to(rank),
-                                                   loss_mask=data["loss_mask"],
-                                                   )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                plosses, vlosses, acces = model(input_ids=data["input_ids"].cuda(),
+                                                    attention_mask=data["attention_mask"].cuda(),
+                                                    loss_mask=data["loss_mask"],
+                                                    )
             epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
             epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
     for i in range(len(epoch_acces)):
         acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
-        deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
+        # deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
-        if global_rank == 0:
-            wandb.log({f"test/epochacc_{i}": acc_i})
-            print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
+        # if global_rank == 0:
+        wandb.log({f"test/epochacc_{i}": acc_i})
+        print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
 
     for i in range(len(epoch_plosses)):
         loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
-        deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
+        # deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
         loss_i = loss_i.item()
-        if global_rank == 0:
-            wandb.log({f"test/epochploss_{i}": loss_i})
-            print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
+        # if global_rank == 0:
+        wandb.log({f"test/epochploss_{i}": loss_i})
+        print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
 
 
-    model_engine.save_16bit_model(f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)
-    if epoch % 10 == 0:
-        deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.savedir}/state_{epoch}")
+    # model_engine.save_16bit_model(f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)
+    # if epoch % 10 == 0:
+    #     deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.savedir}/state_{epoch}")
+
+# save model weights
+torch.save(model.state_dict(), f"{args.savedir}/model.pth")
