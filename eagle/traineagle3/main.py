@@ -16,12 +16,10 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from tqdm import tqdm
 import wandb
 import torch.distributed as dist
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from lr_scheduler import CosineAnnealingWarmupLR
 from torch.optim import AdamW
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-import torch.distributed.checkpoint as dcp
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType, ShardingStrategy
 from utils import rank_0_priority
 
 set_seed(0)
@@ -237,14 +235,16 @@ def main():
     with rank_0_priority():
         model.scandata(args.trainpath, args.basepath)
     model = model.cuda()
-    model = FSDP(model, use_orig_params=True)
+    model = FSDP(model, use_orig_params=True, sharding_strategy=ShardingStrategy.SHARD_GRAD_OP)
     dist.barrier()
 
     # build loss, optimizer, lr scheduler
     criterion = nn.SmoothL1Loss(reduction="none")
     num_epochs = args.num_epochs
     optimizer = AdamW(model.parameters(), lr=1e-4)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=12000)
+    total_steps = len(train_loader) * num_epochs
+    warmup_steps = int(total_steps * 0.02)
+    scheduler = CosineAnnealingWarmupLR(optimizer, total_steps=total_steps, warmup_steps=warmup_steps)
 
     # build dataloaders
     os.makedirs(args.savedir, exist_ok=True)
@@ -310,7 +310,8 @@ def main():
         epoch_plosses = [[] for _ in range(model.length)]
 
         # run testing
-        if epoch % 2 == 0:
+        # TODO: make this an argument
+        if epoch % 1 == 0:
             for batch_idx, data in enumerate(tqdm(test_loader)):
                 # forward pass
                 with torch.no_grad():
@@ -342,7 +343,8 @@ def main():
                     wandb.log({f"test/epochploss_{i}": loss_i})
                     print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
         
-        if epoch % 5 == 0:
+        # TODO: make this an argument
+        if epoch % 1 == 0:
             # Save the model to CHECKPOINT_DIR
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
                 state_dict = {
