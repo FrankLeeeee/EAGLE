@@ -31,7 +31,6 @@ from transformers.activations import ACT2FN
 from transformers import AutoTokenizer
 from modeling_llama_kv import LlamaForCausalLM
 from configs import EConfig
-from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
 
@@ -523,7 +522,7 @@ class Model(nn.Module):
             dataset = dataset['train']
             # dataset = dataset.select(range(96))
             original_columns1 = dataset.column_names
-            num_proc = 48
+            num_proc = 1
 
 
             def preprocess_function(examples):
@@ -620,10 +619,11 @@ class Model(nn.Module):
             dataset = dataset.map(
                 preprocess_function,
                 batched=True,
-                num_proc=num_proc,
+                num_proc=1,
                 remove_columns=original_columns1,
                 load_from_cache_file=False
             )
+            print("finished dataset")
             #dataset.set_format(type="torch")
 
 
@@ -633,9 +633,8 @@ class Model(nn.Module):
             chunks = [dataset[i:i + chunk_size] for i in range(0, len(dataset), chunk_size)]
 
             # 创建进程池
-            with multiprocessing.Pool(num_processes) as pool:
-                # 并行处理数据块
-                results = pool.map(process_data, chunks)
+            results = [process_data(chunk) for chunk in chunks]
+            print("finished process_data")
 
             # 合并结果
             token_dict = merge_dicts(results)

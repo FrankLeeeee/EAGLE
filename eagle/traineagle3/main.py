@@ -25,7 +25,6 @@ train_config = {
     "config_path": "config.json",
 }
 
-from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
@@ -45,7 +44,7 @@ from typing import Any, Dict, List, Optional, Union
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from tqdm import tqdm
-# import accelerate
+import accelerate
 import numpy as np
 from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmup
 
@@ -54,7 +53,6 @@ from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmu
 def build_dataset_rank(
         tokenizer, datapath
 ):
-
     ds = load_dataset('json', data_files=datapath)
     ds = ds['train']
     ds = ds.shuffle(seed=42)
@@ -206,6 +204,8 @@ testdataset = build_dataset_rank(tokenizer, args.testpath)
 config = EConfig.from_pretrained(train_config["config_path"])
 model = Model(config, path=args.basepath, load_emb=True, load_head=True)
 model.scandata(args.trainpath, args.basepath)
+model = model.cuda()
+
 
 
 criterion = nn.SmoothL1Loss(reduction="none")
@@ -216,21 +216,21 @@ model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
                                                      model=model,
                                                      model_parameters=model.parameters(),
                                                      )
+# optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
 global_rank = deepspeed.comm.get_rank()
 rank = deepspeed.comm.get_local_rank()
 world_size = deepspeed.comm.get_world_size()
 if global_rank == 0:
     import wandb
-
     wandb.login(key="")
-    wandb.init(project="l382", entity="yuhui-li", config=ds_config)
+    wandb.init(project="llama3-reproduce", config=ds_config)
 
 os.makedirs(args.savedir, exist_ok=True)
 
-sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=global_rank, shuffle=False)
-test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=4, pin_memory=True,
-                         collate_fn=DataCollatorWithPadding())
+# sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=global_rank, shuffle=False)
+# test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=4, pin_memory=True,
+#                          collate_fn=DataCollatorWithPadding())
 
 train_sampler = DistributedSampler(traindataset, num_replicas=world_size, rank=global_rank, shuffle=True)
 train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=train_sampler, num_workers=4,
@@ -272,7 +272,6 @@ for epoch in range(start_epoch, num_epochs):
     for batch_idx, data in enumerate(tqdm(train_loader)):
 
         model.zero_grad()
-
         plosses, vlosses, acces = model_engine(input_ids=data["input_ids"].to(rank),
                                                attention_mask=data["attention_mask"].to(rank),
                                                loss_mask=data["loss_mask"],
@@ -281,9 +280,8 @@ for epoch in range(start_epoch, num_epochs):
         ploss_weight = [0.8 ** i for i in range(len(plosses))]
         ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
         loss = ploss
+
         model_engine.backward(loss)
-
-
         model_engine.step()
 
         if global_rank == 0:
@@ -293,6 +291,7 @@ for epoch in range(start_epoch, num_epochs):
             for i in range(len(acces)):
                 logdict[f"train/acc_{i}"] = acces[i]
             wandb.log(logdict)
+        
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
@@ -316,32 +315,35 @@ for epoch in range(start_epoch, num_epochs):
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
 
-    for batch_idx, data in enumerate(tqdm(test_loader)):
-        with torch.no_grad():
-            plosses, vlosses, acces = model_engine(input_ids=data["input_ids"].to(rank),
-                                                   attention_mask=data["attention_mask"].to(rank),
-                                                   loss_mask=data["loss_mask"],
-                                                   )
-            epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
-            epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
+    # for batch_idx, data in enumerate(tqdm(test_loader)):
+    #     with torch.no_grad():
+    #         plosses, vlosses, acces = model_engine(input_ids=data["input_ids"].to(rank),
+    #                                                attention_mask=data["attention_mask"].to(rank),
+    #                                                loss_mask=data["loss_mask"],
+    #                                                )
+    #         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
+    #         epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
-    for i in range(len(epoch_acces)):
-        acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
-        deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
-        acc_i = acc_i.item()
-        if global_rank == 0:
-            wandb.log({f"test/epochacc_{i}": acc_i})
-            print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
+    # for i in range(len(epoch_acces)):
+    #     acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+    #     deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
+    #     acc_i = acc_i.item()
+    #     if global_rank == 0:
+    #         wandb.log({f"test/epochacc_{i}": acc_i})
+    #         print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
 
-    for i in range(len(epoch_plosses)):
-        loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
-        deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
-        loss_i = loss_i.item()
-        if global_rank == 0:
-            wandb.log({f"test/epochploss_{i}": loss_i})
-            print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
+    # for i in range(len(epoch_plosses)):
+    #     loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
+    #     deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
+    #     loss_i = loss_i.item()
+    #     if global_rank == 0:
+    #         wandb.log({f"test/epochploss_{i}": loss_i})
+    #         print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
 
 
     model_engine.save_16bit_model(f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)
     if epoch % 10 == 0:
         deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.savedir}/state_{epoch}")
+
+# save model weights
+# torch.save(model.state_dict(), f"{args.savedir}/model.pth")
