@@ -465,7 +465,7 @@ def merge_dicts(dicts):
         result.update(d)
     return result
 class Model(nn.Module):
-    def __init__(self, config, load_head=False, load_emb=True, path=None, target_model=None):
+    def __init__(self, config, load_head=False, load_emb=True, path=None, target_model=None, type="language"):
         super().__init__()
         # self.layers = nn.ModuleList(
         #     [LlamaDecoderLayer(config, index=index) for index in range(config.num_hidden_layers)])
@@ -495,15 +495,26 @@ class Model(nn.Module):
             import json
             import os
             try:
-                with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
-                    index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                with safe_open(os.path.join(path, emb_path),
-                               framework="pt",
-                               device="cpu") as f:
-                    tensor_slice = f.get_slice("model.embed_tokens.weight")
-                    vocab_size, hidden_dim = tensor_slice.get_shape()
-                    tensor = tensor_slice[:, :hidden_dim].float()
+                if type == "language":
+                    with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
+                        index_json = json.loads(f.read())
+                        emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
+                    with safe_open(os.path.join(path, emb_path),
+                                framework="pt",
+                                device="cpu") as f:
+                        tensor_slice = f.get_slice("model.embed_tokens.weight")
+                        vocab_size, hidden_dim = tensor_slice.get_shape()
+                        tensor = tensor_slice[:, :hidden_dim].float()
+                elif type == "multimodal":
+                    with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
+                        index_json = json.loads(f.read())
+                        emb_path = index_json["weight_map"]["language_model.model.embed_tokens.weight"]
+                    with safe_open(os.path.join(path, emb_path),
+                                framework="pt",
+                                device="cpu") as f:
+                        tensor_slice = f.get_slice("language_model.model.embed_tokens.weight")
+                        vocab_size, hidden_dim = tensor_slice.get_shape()
+                        tensor = tensor_slice[:, :hidden_dim].float()
             except:
                 with open(os.path.join(path, "pytorch_model.bin.index.json"), "r") as f:
                     index_json = json.loads(f.read())
@@ -517,7 +528,7 @@ class Model(nn.Module):
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
 
-    def scandata(self, datapath, tokenizerpath):
+    def scandata(self, datapath, tokenizerpath, user_template, assistant_template):
         N = self.draft_vocab_size
         if not os.path.exists("cache.pt"):
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
@@ -572,11 +583,11 @@ class Model(nn.Module):
                     loss_mask = torch.ones_like(input_ids)
                     # print(i)
 
-                    sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                    sep = assistant_template
 
                     total_len = len(input_ids)
 
-                    sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
+                    sep2 = user_template
                     turns = conversation.split(sep2)
 
                     turns[1] = turns[0] + sep2 + turns[1]
@@ -692,7 +703,7 @@ class Model(nn.Module):
     @torch.no_grad()
     def dataprepare(self, input_ids, attention_mask, loss_mask):
         device = input_ids.device
-        outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask)
+        outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, past_key_values=None)
         hidden_states0 = outs.hidden_states[0]
         hidden_states1 = outs.hidden_states[1]
         hidden_states2 = outs.hidden_states[2]

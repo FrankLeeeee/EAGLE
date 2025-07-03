@@ -26,7 +26,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType, ShardingStrategy
 from utils import rank_0_priority
 
-from .modeling_llama4_17x16_kv import Llama4ForCausalLM, Llama4TextConfig, Llama4TextDecoderLayer
+from modeling_llama4_17x16_kv import Llama4ForCausalLM, Llama4TextConfig, Llama4TextDecoderLayer
 
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
@@ -34,6 +34,8 @@ set_seed(0)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
+user_template = "<|eot|><|header_start|>user<|header_end|>"
+assistant_template = "<|eot|><|header_start|>assistant<|header_end|>\n\n"
 
 def parse_args():
     parser = argparse.ArgumentParser(description='eagle3')
@@ -113,13 +115,12 @@ def build_dataset_rank(
                 add_special_tokens=False,
             ).input_ids[0]
             loss_mask = torch.ones_like(input_ids)
-            # print(i)
 
-            sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            sep = assistant_template
 
             total_len = len(input_ids)
 
-            sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
+            sep2 = user_template
             turns = conversation.split(sep2)
 
             turns[1] = turns[0] + sep2 + turns[1]
@@ -315,9 +316,9 @@ def main():
     config = EConfig.from_pretrained(args.config_path)
     # build target model
     
-    config = Llama4TextConfig.from_pretrained("/tmp/Llama-4-Scout-17B-16E-Instruct")
+    llama4_config = Llama4TextConfig.from_pretrained("/tmp/Llama-4-Scout-17B-16E-Instruct")
     with torch.device("meta"):
-        target_model = Llama4ForCausalLM(config).to(torch.bfloat16)
+        target_model = Llama4ForCausalLM(llama4_config).to(torch.bfloat16)
 
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
@@ -326,18 +327,16 @@ def main():
         },
     )
 
-    model = Model(config, path=args.basepath, load_emb=True, load_head=True, target_model=target_model).to(torch.bfloat16)
+    model = Model(config, path=args.basepath, load_emb=True, load_head=True, target_model=target_model, type="multimodal").to(torch.bfloat16)
     ignored_modules = [model.midlayer]
-    with rank_0_priority():
-        model.scandata(args.trainpath, args.basepath)
+
     # model = model.cuda()
-    model = FSDP(
-        model,
+    model.target_model = FSDP(
+        model.target_model,
         auto_wrap_policy=llama_auto_wrap_policy,     
         param_init_fn=param_init_fn,                
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
-        ignored_modules=ignored_modules
     )
     dist.barrier()
     
@@ -345,6 +344,8 @@ def main():
     with FSDP.state_dict_type(target_model, StateDictType.FULL_STATE_DICT):
         target_model.load_state_dict(dict)
     
+    with rank_0_priority():
+        model.scandata(args.trainpath, args.basepath, user_template, assistant_template)
 
     # build loss, optimizer, lr scheduler
     criterion = nn.SmoothL1Loss(reduction="none")
