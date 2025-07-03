@@ -465,7 +465,7 @@ def merge_dicts(dicts):
         result.update(d)
     return result
 class Model(nn.Module):
-    def __init__(self, config, load_head=False, load_emb=True, path=None):
+    def __init__(self, config, load_head=False, load_emb=True, path=None, target_model=None):
         super().__init__()
         # self.layers = nn.ModuleList(
         #     [LlamaDecoderLayer(config, index=index) for index in range(config.num_hidden_layers)])
@@ -477,7 +477,10 @@ class Model(nn.Module):
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
-        self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+        if target_model is None:
+            self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+        else:
+            self.target_model = target_model
         self.target_model.eval()
         self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
         for param in self.target_model.parameters():
