@@ -492,7 +492,7 @@ class Llama4TextModel(Llama4PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = True,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
@@ -541,12 +541,17 @@ class Llama4TextModel(Llama4PreTrainedModel):
         freq_cis = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
-        all_hidden_states = () if output_hidden_states else None
+        all_hidden_states = ()
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            if output_hidden_states:
+        for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            if idx == len(self.layers) - 3 or idx == len(self.layers) // 2 or idx == 2:
                 all_hidden_states += (hidden_states,)
+            
+            # if output_hidden_states:
+            #     all_hidden_states += (hidden_states,)
+
+            past_key_values = None
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(

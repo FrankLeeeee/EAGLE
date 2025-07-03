@@ -23,7 +23,7 @@ import torch.distributed as dist
 from lr_scheduler import CosineAnnealingWarmupLR
 from torch.optim import AdamW
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType, ShardingStrategy
+from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType, ShardingStrategy, FullStateDictConfig
 from utils import rank_0_priority
 
 from modeling_llama4_17x16_kv import Llama4ForCausalLM, Llama4TextConfig, Llama4TextDecoderLayer
@@ -330,6 +330,12 @@ def main():
     model = Model(config, path=args.basepath, load_emb=True, load_head=True, target_model=target_model, type="multimodal").to(torch.bfloat16)
     ignored_modules = [model.midlayer]
 
+    model.midlayer = model.midlayer.cuda()
+    model.norm = model.norm.cuda()
+    model.fc = model.fc.cuda()
+    model.embed_tokens.cuda()
+    model.lm_head.cuda()
+
     # model = model.cuda()
     model.target_model = FSDP(
         model.target_model,
@@ -341,8 +347,11 @@ def main():
     dist.barrier()
     
     dict = load_checkpoint(args.basepath)
-    with FSDP.state_dict_type(target_model, StateDictType.FULL_STATE_DICT):
-        target_model.load_state_dict(dict)
+    
+    # cfg = FullStateDictConfig(rank0_only=True)
+    with FSDP.state_dict_type(model.target_model, StateDictType.FULL_STATE_DICT):
+        model.target_model.load_state_dict(dict)
+    dist.barrier()
     
     with rank_0_priority():
         model.scandata(args.trainpath, args.basepath, user_template, assistant_template)

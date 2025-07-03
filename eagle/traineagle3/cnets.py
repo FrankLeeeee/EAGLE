@@ -671,8 +671,8 @@ class Model(nn.Module):
             torch.save(cache, "cache.pt")
         else:
             cache = torch.load("cache.pt")
-            d2t = cache["d2t"]
-            t2d = cache["t2d"]
+            d2t = cache["d2t"].cuda()
+            t2d = cache["t2d"].cuda()
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
         self.l1smooth = nn.SmoothL1Loss(reduction="none")
