@@ -60,6 +60,11 @@ class Llama4TextExperts(nn.Module):
         next_states = next_states.view(-1, self.hidden_size)
         return next_states
 
+    def reset_parameters(self):
+        # use xavier normal initialization
+        torch.nn.init.xavier_normal_(self.gate_up_proj)
+        torch.nn.init.xavier_normal_(self.down_proj)
+
 
 # Phi3MLP
 class Llama4TextMLP(nn.Module):
@@ -94,6 +99,9 @@ class Llama4TextL2Norm(torch.nn.Module):
     def extra_repr(self):
         return f"eps={self.eps}"
 
+    def reset_parameters(self):
+        pass
+
 
 class Llama4TextRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-5):
@@ -113,6 +121,9 @@ class Llama4TextRMSNorm(nn.Module):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+    def reset_parameters(self):
+        self.weight.data.fill_(1.0)
 
 
 @use_kernel_forward_from_hub("Llama4TextMoe")
@@ -189,6 +200,10 @@ class Llama4TextRotaryEmbedding(nn.Module):
             freqs_cis = freqs_cis * self.attention_scaling
 
         return freqs_cis
+
+    def reset_parameters(self):
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, None)
+        self.inv_freq.copy_(inv_freq)
 
 
 def apply_rotary_emb(

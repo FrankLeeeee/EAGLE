@@ -132,6 +132,14 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
 
+    def reset_parameters(self):
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(None) / self.dim))
+        self.inv_freq.copy_(inv_freq)
+
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            seq_len=self.max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+        )
 
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """LlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
@@ -356,6 +364,9 @@ class LlamaRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+    def reset_parameters(self):
+        torch.nn.init.ones_(self.weight)
 
 
 class LlamaDecoderLayeremb(nn.Module):
