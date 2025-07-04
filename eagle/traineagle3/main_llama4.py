@@ -58,7 +58,8 @@ def init_wandb(args):
 
 
 def init_distributed():
-    dist.init_process_group(backend="nccl")
+    from datetime import timedelta
+    dist.init_process_group(backend="nccl", timeout=timedelta(hours=3))
     torch.cuda.set_device(dist.get_rank())
 
 def build_dataset_rank(
@@ -224,9 +225,6 @@ def prepare_dataloaders(args, tokenizer):
                              collate_fn=DataCollatorWithPadding())
     return train_loader, test_loader, train_sampler, test_sampler
 
-def param_init_fn(module):
-    module.to_empty(device=torch.cuda.current_device())
-
 def get_files_containing_params(checkpoint_folder: str, param_prefix: str="language_model.") -> List[str]:
     """
     根据参数名前缀找到包含这些参数的safetensors文件
@@ -290,6 +288,7 @@ def load_checkpoint(checkpoint_path):
             clean_key = key
             if key.startswith("language_model."):
                 clean_key = key[len("language_model."):]
+                clean_key = "target_model." + clean_key
                 merged_state_dict[clean_key] = value
 
         # delete the state_dict to free up memory; TODO check if this del is needed
@@ -314,8 +313,8 @@ def main():
 
     # build model and apply fsdp
     config = EConfig.from_pretrained(args.config_path)
-    # build target model
     
+    # build target model
     llama4_config = Llama4TextConfig.from_pretrained("/tmp/Llama-4-Scout-17B-16E-Instruct")
     with torch.device("meta"):
         target_model = Llama4ForCausalLM(llama4_config).to(torch.bfloat16)
@@ -328,33 +327,28 @@ def main():
     )
 
     model = Model(config, path=args.basepath, load_emb=True, load_head=True, target_model=target_model, type="multimodal").to(torch.bfloat16)
-    ignored_modules = [model.midlayer]
 
-    model.midlayer = model.midlayer.cuda()
-    model.norm = model.norm.cuda()
-    model.fc = model.fc.cuda()
-    model.embed_tokens.cuda()
-    model.lm_head.cuda()
-
-    # model = model.cuda()
-    model.target_model = FSDP(
-        model.target_model,
+    model = FSDP(
+        model,
+        use_orig_params=True,
         auto_wrap_policy=llama_auto_wrap_policy,     
-        param_init_fn=param_init_fn,                
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
     )
     dist.barrier()
-    
+
     dict = load_checkpoint(args.basepath)
     
     # cfg = FullStateDictConfig(rank0_only=True)
-    with FSDP.state_dict_type(model.target_model, StateDictType.FULL_STATE_DICT):
-        model.target_model.load_state_dict(dict)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+        model.load_state_dict(dict, strict=False)
     dist.barrier()
+    model = model.cuda()
+
     
     with rank_0_priority():
         model.scandata(args.trainpath, args.basepath, user_template, assistant_template)
+    print("Finished scanning data")
 
     # build loss, optimizer, lr scheduler
     criterion = nn.SmoothL1Loss(reduction="none")
@@ -380,7 +374,7 @@ def main():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 plosses, vlosses, acces = model(input_ids=data["input_ids"].cuda(),
                                                     attention_mask=data["attention_mask"].cuda(),
-                                                    loss_mask=data["loss_mask"],
+                                                    loss_mask=data["loss_mask"].cuda(),
                                                     )
 
             # calculate ploss
@@ -436,7 +430,7 @@ def main():
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         plosses, vlosses, acces = model(input_ids=data["input_ids"].cuda(),
                                                             attention_mask=data["attention_mask"].cuda(),
-                                                            loss_mask=data["loss_mask"],
+                                                            loss_mask=data["loss_mask"].cuda(),
                                                             )
                     epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
                     epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
@@ -463,15 +457,15 @@ def main():
         
         # TODO: make this an argument
         if epoch % 1 == 0:
-            # Save the model to CHECKPOINT_DIR
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-                state_dict = {
-                    "model": model.state_dict(),
-                }
+            # Save the draft model to CHECKPOINT_DIR
+            state_dict = {}
+            for name, param in model.named_parameters():
+                if "target" not in name:
+                    state_dict[name] = param.data
 
-                if dist.get_rank() == 0:
-                    torch.save(state_dict, f"{args.savedir}/model_{epoch}.pth")
-                dist.barrier()
+            if dist.get_rank() == 0:
+                torch.save(state_dict, f"{args.savedir}/model_{epoch}.pth")
+            dist.barrier()
 
 if __name__ == "__main__":
     main()
