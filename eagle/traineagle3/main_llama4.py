@@ -27,7 +27,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType, ShardingStrategy, FullStateDictConfig
 from utils import rank_0_priority
 
-from modeling_llama4_17x16_kv import Llama4ForCausalLM, Llama4TextConfig, Llama4TextDecoderLayer
+from modeling_llama4_17x16_kv import Llama4ForCausalLM, Llama4TextDecoderLayer
+from transformers.models.llama4.configuration_llama4 import Llama4TextConfig
 
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
