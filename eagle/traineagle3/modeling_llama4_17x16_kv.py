@@ -204,6 +204,7 @@ class Llama4TextRotaryEmbedding(nn.Module):
     def reset_parameters(self):
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, None)
         self.inv_freq.copy_(inv_freq)
+        self.original_inv_freq = self.inv_freq
 
 
 def apply_rotary_emb(
