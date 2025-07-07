@@ -43,7 +43,7 @@ def parse_args():
 
 
 def init_wandb(args):
-    wandb.login()
+    wandb.login(key="d38075491c84c0774138377d6ff2e94befa16324")
     wandb.init(project="eagle-llama3-sample", config=args)
 
 

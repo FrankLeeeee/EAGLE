@@ -134,8 +134,10 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         )
 
     def reset_parameters(self):
+        print(f"cnets LlamaRotaryEmbedding before init: {self.inv_freq}, {self.inv_freq.shape}")
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(None) / self.dim))
         self.inv_freq.copy_(inv_freq)
+        print(f"cnets LlamaRotaryEmbedding after init: {self.inv_freq}, {self.inv_freq.shape}")
 
         # Build here to make `torch.jit.trace` work.
         self._set_cos_sin_cache(
@@ -367,7 +369,9 @@ class LlamaRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
     def reset_parameters(self):
+        # print(f"cnets LlamaRMSNorm before init: {self.weight}")
         torch.nn.init.ones_(self.weight)
+        print(f"cnets LlamaRMSNorm after init: {self.weight}")
 
 
 class LlamaDecoderLayeremb(nn.Module):

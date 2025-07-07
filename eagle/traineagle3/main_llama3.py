@@ -27,8 +27,11 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType, ShardingStrategy, FullStateDictConfig
 from utils import rank_0_priority
 
-from modeling_llama4_17x16_kv import Llama4ForCausalLM, Llama4TextDecoderLayer
-from transformers.models.llama4.configuration_llama4 import Llama4TextConfig
+
+# from modeling_llama4_17x16_kv import Llama4ForCausalLM, Llama4TextDecoderLayer
+# from transformers.models.llama4.configuration_llama4 import Llama4TextConfig
+from transformers.models.llama.modeling_llama import LlamaConfig
+from modeling_llama_kv import LlamaForCausalLM, LlamaDecoderLayer
 
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
@@ -229,7 +232,7 @@ def prepare_dataloaders(args, tokenizer):
                              collate_fn=DataCollatorWithPadding())
     return train_loader, test_loader, train_sampler, test_sampler
 
-def get_files_containing_params(checkpoint_folder: str, param_prefix: str="language_model.") -> List[str]:
+def get_files_containing_params(checkpoint_folder: str, param_prefix: str="") -> List[str]:
     """
     根据参数名前缀找到包含这些参数的safetensors文件
     
@@ -256,9 +259,8 @@ def get_files_containing_params(checkpoint_folder: str, param_prefix: str="langu
     matching_params = []
     
     for param_name, file_name in index_data['weight_map'].items():
-        if param_name.startswith(param_prefix):
-            target_files.add(file_name)
-            matching_params.append(param_name)
+        target_files.add(file_name)
+        matching_params.append(param_name)
     
     # 生成完整路径
     full_paths = [os.path.join(checkpoint_folder, f) for f in sorted(target_files)]
@@ -290,10 +292,8 @@ def load_checkpoint(checkpoint_path):
                     f"Found {type(value)} instead."
                 )
             clean_key = key
-            if key.startswith("language_model."):
-                clean_key = key[len("language_model."):]
-                clean_key = "target_model." + clean_key
-                merged_state_dict[clean_key] = value
+            clean_key = "target_model." + clean_key
+            merged_state_dict[clean_key] = value
 
         # delete the state_dict to free up memory; TODO check if this del is needed
         del state_dict
@@ -318,19 +318,35 @@ def main():
     # build model and apply fsdp
     config = EConfig.from_pretrained(args.config_path)
     
-    # build target model
-    llama4_config = Llama4TextConfig.from_pretrained(args.basepath)
-    with torch.device("meta"):
-        target_model = Llama4ForCausalLM(llama4_config).to(torch.bfloat16)
+
+
+    # from modeling_llama_kv import LlamaRotaryEmbedding, LlamaRMSNorm, LlamaRotaryEmbedding_L31
+    # for name, module in target_model.named_modules():
+    #     if isinstance(module, LlamaRotaryEmbedding_L31):
+    #         print(name, module.inv_freq)
+    #     elif isinstance(module, LlamaRMSNorm):
+    #         print(name, module.weight)
+    #     elif isinstance(module, LlamaRotaryEmbedding):
+    #         print(name, module.inv_freq)
 
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
-            Llama4TextDecoderLayer,
+            LlamaDecoderLayer,
         },
     )
 
+        # build target model
+    llama_config = LlamaConfig.from_pretrained(args.basepath)
+    with torch.device("meta"):
+        target_model = LlamaForCausalLM(llama_config).to(torch.bfloat16)
     model = Model(config, path=args.basepath, load_emb=True, load_head=True, target_model=target_model, type="language").to(torch.bfloat16)
+    ignored_modules = [model.midlayer, model.embed_tokens, model.lm_head, model.norm]
+    
+    from cnets import LlamaRotaryEmbedding
+    for name, module in model.named_modules():
+        if isinstance(module, LlamaRotaryEmbedding):
+            print(name, module.inv_freq)
 
     model = FSDP(
         model,
@@ -338,14 +354,22 @@ def main():
         auto_wrap_policy=llama_auto_wrap_policy,     
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
+        ignored_modules=ignored_modules,
     )
     print("finished wrapping fsdp")
 
-    dict = load_checkpoint(args.basepath)
+    ckpt_dict = load_checkpoint(args.basepath)
     
     # cfg = FullStateDictConfig(rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-        model.load_state_dict(dict, strict=False)
+        model.load_state_dict(ckpt_dict, strict=False)
+
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+        state_dict = model.state_dict()
+        for key, weight in state_dict.items():
+            if key in ckpt_dict:
+                assert torch.equal(weight, ckpt_dict[key].cuda())
+
     model = model.cuda()
     print("finished loading checkpoint")
     

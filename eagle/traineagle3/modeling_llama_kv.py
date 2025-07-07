@@ -130,6 +130,10 @@ class LlamaRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+    
+    def reset_parameters(self):
+        # print(f"LlamaRMSNorm before init: {self.weight}")
+        torch.nn.init.ones_(self.weight)
 
 
 class LlamaRotaryEmbedding(nn.Module):
@@ -204,6 +208,20 @@ class LlamaRotaryEmbedding(nn.Module):
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
 
+    def reset_parameters(self):
+        # print(f"LlamaRotaryEmbedding before init: {self.inv_freq}")
+        inv_freq = 1.0 / (
+                self.base ** (torch.arange(0, self.dim, 2).float().to(None) / self.dim)
+        )
+        self.inv_freq.copy_(inv_freq)
+
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            seq_len=self.max_position_embeddings,
+            device=self.inv_freq.device,
+            dtype=torch.get_default_dtype(),
+        )
+
 
 class LlamaRotaryEmbedding_L31(nn.Module):
     def __init__(
@@ -217,6 +235,13 @@ class LlamaRotaryEmbedding_L31(nn.Module):
         config: Optional[LlamaConfig] = None,
     ):
         super().__init__()
+        self.dim = dim
+        self.base = base
+        self.max_position_embeddings = max_position_embeddings
+        self.device = device
+        self.scaling_factor = scaling_factor
+        self.rope_type = rope_type
+
         # TODO (joao): remove the `if` below, only used for BC
         self.rope_kwargs = {}
         if config is None:
@@ -290,6 +315,12 @@ class LlamaRotaryEmbedding_L31(nn.Module):
         sin = sin * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+    def reset_parameters(self):
+        # print(f"LlamaRotaryEmbedding_L31 before init: {self.inv_freq}")
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, self.device, **self.rope_kwargs)
+        self.inv_freq.copy_(inv_freq)
+        self.original_inv_freq = self.inv_freq
 
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """
