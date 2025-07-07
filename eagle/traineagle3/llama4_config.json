@@ -2,6 +2,8 @@
   "architectures": [
     "LlamaForCausalLM"
   ],
+  "bos_token_id": 200000,
+  "eos_token_id": 200008,
   "hidden_act": "silu",
   "hidden_size": 5120,
   "initializer_range": 0.02,

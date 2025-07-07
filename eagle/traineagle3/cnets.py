@@ -506,33 +506,16 @@ class Model(nn.Module):
             from safetensors import safe_open
             import json
             import os
-            try:
-                if type == "language":
-                    with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
-                        index_json = json.loads(f.read())
-                        emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                    with safe_open(os.path.join(path, emb_path),
-                                framework="pt",
-                                device="cpu") as f:
-                        tensor_slice = f.get_slice("model.embed_tokens.weight")
-                        vocab_size, hidden_dim = tensor_slice.get_shape()
-                        tensor = tensor_slice[:, :hidden_dim].float()
-                elif type == "multimodal":
-                    with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
-                        index_json = json.loads(f.read())
-                        emb_path = index_json["weight_map"]["language_model.model.embed_tokens.weight"]
-                    with safe_open(os.path.join(path, emb_path),
-                                framework="pt",
-                                device="cpu") as f:
-                        tensor_slice = f.get_slice("language_model.model.embed_tokens.weight")
-                        vocab_size, hidden_dim = tensor_slice.get_shape()
-                        tensor = tensor_slice[:, :hidden_dim].float()
-            except:
-                with open(os.path.join(path, "pytorch_model.bin.index.json"), "r") as f:
-                    index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                weights = torch.load(os.path.join(path, emb_path))
-                tensor = weights["model.embed_tokens.weight"].float()
+            with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
+                index_json = json.loads(f.read())
+                emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
+            with safe_open(os.path.join(path, emb_path),
+                        framework="pt",
+                        device="cpu") as f:
+                tensor_slice = f.get_slice("model.embed_tokens.weight")
+                vocab_size, hidden_dim = tensor_slice.get_shape()
+                tensor = tensor_slice[:, :hidden_dim].float()
+
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, _weight=tensor)
 
         self.lm_head = nn.Linear(config.hidden_size, config.draft_vocab_size, bias=False)
@@ -540,7 +523,7 @@ class Model(nn.Module):
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
 
-    def scandata(self, datapath, tokenizerpath, user_template, assistant_template):
+    def scandata(self, datapath, tokenizerpath):
         N = self.draft_vocab_size
         if not os.path.exists("cache.pt"):
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
@@ -553,14 +536,14 @@ class Model(nn.Module):
 
             def preprocess_function(examples):
                 new_examples = {
-                    # "conversation": [],
+                    "attention_mask": [],
                     "input_ids": [],
                     "loss_mask": []
                 }
                 for i in range(len(examples['conversations'])):
                     messages = [
                         {"role": "system",
-                         "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
+                        "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
                     ]
                     convroles = ["user", "assistant"]
                     source = examples['conversations'][i]
@@ -586,42 +569,60 @@ class Model(nn.Module):
                     if not tokenizer.pad_token_id:
                         tokenizer.pad_token_id = tokenizer.unk_token_id
 
-                    encoding = tokenizer(
+                    input_ids = tokenizer(
                         conversation,
                         return_tensors="pt",
                         max_length=2048,
                         add_special_tokens=False,
-                        return_offsets_mapping=True,
-                        truncation=True,
-                    )
-                    input_ids = encoding.input_ids[0]
-                    offsets = encoding.offset_mapping[0]
-                    loss_mask = torch.zeros_like(input_ids)
-                    
-                    assistant_header = "<|header_start|>assistant<|header_end|>\n\n"
-                    user_header = "<|header_start|>user<|header_end|>"
-                    end_of_turn_token = "<|eot|>"
+                    ).input_ids[0]
+                    loss_mask = torch.ones_like(input_ids)
+                    # print(i)
 
-                    
-                    assistant_pattern = (
-                        re.escape(assistant_header) + r"(.*?)(?=" + re.escape(user_header) + "|" + re.escape(end_of_turn_token) + "|$)"
-                    )
-                    
-                    for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
-                        assistant_start_char = match.start(1)
-                        assistant_end_char = match.end(1)
-                        
-                        for idx, (token_start, token_end) in enumerate(offsets):
-                            if token_end <= assistant_start_char:
-                                continue
-                            if token_start >= assistant_end_char:
-                                continue
-                            loss_mask[idx] = 1
+                    sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+                    total_len = len(input_ids)
+
+                    sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
+                    turns = conversation.split(sep2)
+
+                    turns[1] = turns[0] + sep2 + turns[1]
+                    turns = turns[1:]
+
+                    cur_len = 1
+                    loss_mask[:cur_len] = 0
+                    for i, turn in enumerate(turns):
+                        if turn == "":
+                            break
+                        turn_len = len(tokenizer(turn).input_ids)
+
+                        parts = turn.split(sep)
+                        if len(parts) != 2:
+                            break
+                        parts[0] += sep
+                        # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
+                        instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+
+                        # Ignore the user instructions
+                        if i == 0:
+                            loss_mask[cur_len: cur_len + instruction_len - 2] = 0
+                        else:
+                            loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
+                        cur_len += turn_len
+                        if i != 0:
+                            cur_len += 3
+                        # cur_len+=2
+
+                        # if i != 0 and not tokenizer.legacy:
+                        #     # The legacy and non-legacy modes handle special tokens differently
+                        #     cur_len -= 1
+
+                    loss_mask[cur_len:] = 0
+                    attention_mask = torch.ones_like(loss_mask)
 
                     # new_examples["conversation"].append(conversation)
                     new_examples["input_ids"].append(input_ids[None, :])
                     new_examples["loss_mask"].append(loss_mask[None, :])
-
+                    new_examples["attention_mask"].append(attention_mask[None, :])
                 return new_examples
 
             dataset = dataset.map(
@@ -645,7 +646,6 @@ class Model(nn.Module):
             # 合并结果
             token_dict = merge_dicts(results)
 
-
             total_frequency = sum(token_dict.values())
             top_N = token_dict.most_common(N)
             top_N_frequency_sum = sum(freq for key, freq in top_N)
@@ -666,6 +666,9 @@ class Model(nn.Module):
             cache = torch.load("cache.pt")
             d2t = cache["d2t"].cuda()
             t2d = cache["t2d"].cuda()
+        
+        d2t = d2t.cuda()
+        t2d = t2d.cuda()
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
         self.l1smooth = nn.SmoothL1Loss(reduction="none")
