@@ -306,8 +306,8 @@ def main():
     print(args)
     init_distributed()
 
-    if dist.get_rank() == 0:
-        init_wandb(args)
+    # if dist.get_rank() == 0:
+    #     init_wandb(args)
 
     # build tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.basepath)
@@ -329,39 +329,44 @@ def main():
     #     elif isinstance(module, LlamaRotaryEmbedding):
     #         print(name, module.inv_freq)
 
-    llama_auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            LlamaDecoderLayer,
-        },
-    )
+    # llama_auto_wrap_policy = functools.partial(
+    #     transformer_auto_wrap_policy,
+    #     transformer_layer_cls={
+    #         LlamaDecoderLayer,
+    #     },
+    # )
 
         # build target model
-    llama_config = LlamaConfig.from_pretrained(args.basepath)
+    
+
+    # model = Model(config, path=args.basepath, load_emb=True, load_head=True, type="language").to(torch.bfloat16)
+    # model.scandata(args.trainpath, args.basepath)
+
+    
 
     if dist.get_rank() == 0:
-        model = Model(config, path=args.basepath, load_emb=True, load_head=True, type="language").to(torch.bfloat16)
-        model.scandata(args.trainpath, args.basepath)
+        target_model = LlamaForCausalLM.from_pretrained(args.basepath)
     else:
+        # with torch.device("meta"):
+        llama_config = LlamaConfig.from_pretrained(args.basepath)
         with torch.device("meta"):
-            target_model = LlamaForCausalLM(llama_config).to(torch.bfloat16)
-            model = Model(config, path=args.basepath, load_emb=True, load_head=True, target_model=target_model, type="language").to(torch.bfloat16)
-            model.scandata(args.trainpath, args.basepath)
-            model.d2t = model.d2t.to(torch.device("meta"))
-            model.t2d = model.t2d.to(torch.device("meta"))
-    # ignored_modules = [model.midlayer, model.embed_tokens, model.lm_head, model.norm]
+            target_model = LlamaForCausalLM(llama_config)
+    model = Model(config, path=args.basepath, load_emb=True, load_head=True, target_model=target_model, type="language").to(torch.bfloat16)
+    model.scandata(args.trainpath, args.basepath)
     dist.barrier()
     
 
-    from cnets import LlamaRotaryEmbedding
-    for name, module in model.named_modules():
-        if isinstance(module, LlamaRotaryEmbedding):
-            print(name, module.inv_freq)
+    # from cnets import LlamaRotaryEmbedding
+    # for name, module in model.named_modules():
+    #     if isinstance(module, LlamaRotaryEmbedding):
+    #         print(name, module.inv_freq)
 
     model = FSDP(
         model,
         use_orig_params=True,
-        auto_wrap_policy=llama_auto_wrap_policy,     
+        # auto_wrap_policy=llama_auto_wrap_policy,     
+        auto_wrap_policy=None,
+        param_init_fn=lambda module: module.to_empty(device=torch.cuda.current_device()),
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
         sync_module_states=True,
@@ -382,11 +387,7 @@ def main():
     print("finished loading checkpoint")
 
 
-    
-
-
     # build loss, optimizer, lr scheduler
-    criterion = nn.SmoothL1Loss(reduction="none")
     num_epochs = args.num_epochs
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
     total_steps = len(train_loader) * num_epochs
@@ -422,13 +423,13 @@ def main():
             optimizer.step()
             scheduler.step()
 
-            if dist.get_rank() == 0:
-                logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
-                for i in range(len(plosses)):
-                    logdict[f"train/ploss_{i}"] = plosses[i].item()
-                for i in range(len(acces)):
-                    logdict[f"train/acc_{i}"] = acces[i]
-                wandb.log(logdict)
+            # if dist.get_rank() == 0:
+            #     logdict = {"train/lr": optimizer.param_groups[0]["lr"]}
+            #     for i in range(len(plosses)):
+            #         logdict[f"train/ploss_{i}"] = plosses[i].item()
+            #     for i in range(len(acces)):
+            #         logdict[f"train/acc_{i}"] = acces[i]
+            #     wandb.log(logdict)
             epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
             epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
@@ -439,9 +440,9 @@ def main():
             acc_i = acc_i / dist.get_world_size()
             acc_i = acc_i.item()
 
-            if dist.get_rank() == 0:
-                wandb.log({f"train/epochacc_{i}": acc_i})
-                print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
+            # if dist.get_rank() == 0:
+            #     wandb.log({f"train/epochacc_{i}": acc_i})
+            #     print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
 
         for i in range(len(epoch_plosses)):
             loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
@@ -449,46 +450,46 @@ def main():
             loss_i = loss_i / dist.get_world_size()
             loss_i = loss_i.item()
 
-            if dist.get_rank() == 0:
-                wandb.log({f"train/epochploss_{i}": loss_i})
-                print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
+            # if dist.get_rank() == 0:
+            #     wandb.log({f"train/epochploss_{i}": loss_i})
+            #     print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
 
         epoch_acces = [[] for _ in range(model.length)]
         epoch_plosses = [[] for _ in range(model.length)]
 
         # run testing
         # TODO: make this an argument
-        if epoch % 1 == 0:
-            for batch_idx, data in enumerate(tqdm(test_loader)):
-                # forward pass
-                with torch.no_grad():
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        plosses, vlosses, acces = model(input_ids=data["input_ids"].cuda(),
-                                                            attention_mask=data["attention_mask"].cuda(),
-                                                            loss_mask=data["loss_mask"].cuda(),
-                                                            )
-                    epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
-                    epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
+        # if epoch % 1 == 0:
+        #     for batch_idx, data in enumerate(tqdm(test_loader)):
+        #         # forward pass
+        #         with torch.no_grad():
+        #             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        #                 plosses, vlosses, acces = model(input_ids=data["input_ids"].cuda(),
+        #                                                     attention_mask=data["attention_mask"].cuda(),
+        #                                                     loss_mask=data["loss_mask"].cuda(),
+        #                                                     )
+        #             epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
+        #             epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
-            for i in range(len(epoch_acces)):
-                acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
-                dist.all_reduce(acc_i)
-                acc_i = acc_i / dist.get_world_size()
-                acc_i = acc_i.item()
+        #     for i in range(len(epoch_acces)):
+        #         acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+        #         dist.all_reduce(acc_i)
+        #         acc_i = acc_i / dist.get_world_size()
+        #         acc_i = acc_i.item()
 
-                if dist.get_rank() == 0:
-                    wandb.log({f"test/epochacc_{i}": acc_i})
-                    print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
+                # if dist.get_rank() == 0:
+                #     wandb.log({f"test/epochacc_{i}": acc_i})
+                #     print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
 
-            for i in range(len(epoch_plosses)):
-                loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
-                dist.all_reduce(loss_i)
-                loss_i = loss_i / dist.get_world_size()
-                loss_i = loss_i.item()
+            # for i in range(len(epoch_plosses)):
+            #     loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
+            #     dist.all_reduce(loss_i)
+            #     loss_i = loss_i / dist.get_world_size()
+            #     loss_i = loss_i.item()
 
-                if dist.get_rank() == 0:
-                    wandb.log({f"test/epochploss_{i}": loss_i})
-                    print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
+                # if dist.get_rank() == 0:
+                #     wandb.log({f"test/epochploss_{i}": loss_i})
+                #     print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
         
         # TODO: make this an argument
         if epoch % 1 == 0:
