@@ -338,11 +338,21 @@ def main():
 
         # build target model
     llama_config = LlamaConfig.from_pretrained(args.basepath)
-    with torch.device("meta"):
-        target_model = LlamaForCausalLM(llama_config).to(torch.bfloat16)
-    model = Model(config, path=args.basepath, load_emb=True, load_head=True, target_model=target_model, type="language").to(torch.bfloat16)
-    ignored_modules = [model.midlayer, model.embed_tokens, model.lm_head, model.norm]
+
+    if dist.get_rank() == 0:
+        model = Model(config, path=args.basepath, load_emb=True, load_head=True, type="language").to(torch.bfloat16)
+        model.scandata(args.trainpath, args.basepath)
+    else:
+        with torch.device("meta"):
+            target_model = LlamaForCausalLM(llama_config).to(torch.bfloat16)
+            model = Model(config, path=args.basepath, load_emb=True, load_head=True, target_model=target_model, type="language").to(torch.bfloat16)
+            model.scandata(args.trainpath, args.basepath)
+            model.d2t = model.d2t.to(torch.device("meta"))
+            model.t2d = model.t2d.to(torch.device("meta"))
+    # ignored_modules = [model.midlayer, model.embed_tokens, model.lm_head, model.norm]
+    dist.barrier()
     
+
     from cnets import LlamaRotaryEmbedding
     for name, module in model.named_modules():
         if isinstance(module, LlamaRotaryEmbedding):
@@ -354,28 +364,26 @@ def main():
         auto_wrap_policy=llama_auto_wrap_policy,     
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
-        ignored_modules=ignored_modules,
+        sync_module_states=True,
+        # ignored_modules=ignored_modules,
     )
     print("finished wrapping fsdp")
 
-    ckpt_dict = load_checkpoint(args.basepath)
-    
-    # cfg = FullStateDictConfig(rank0_only=True)
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-        model.load_state_dict(ckpt_dict, strict=False)
+    # for name, buffer in model.named_buffers():
+    #     print(name, buffer)
 
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-        state_dict = model.state_dict()
-        for key, weight in state_dict.items():
-            if key in ckpt_dict:
-                assert torch.equal(weight, ckpt_dict[key].cuda())
+    # ckpt_dict = load_checkpoint(args.basepath)
+    
+    # # cfg = FullStateDictConfig(rank0_only=True)
+    # with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+    #     model.load_state_dict(ckpt_dict, strict=False)
 
     model = model.cuda()
     print("finished loading checkpoint")
+
+
     
-    with rank_0_priority():
-        model.scandata(args.trainpath, args.basepath)
-    print("Finished scanning data")
+
 
     # build loss, optimizer, lr scheduler
     criterion = nn.SmoothL1Loss(reduction="none")
