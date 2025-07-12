@@ -477,7 +477,7 @@ def merge_dicts(dicts):
         result.update(d)
     return result
 class Model(nn.Module):
-    def __init__(self, config, load_head=False, load_emb=True, path=None, target_model=None, type="language"):
+    def __init__(self, config, load_head=False, load_emb=True, path=None, type="language"):
         super().__init__()
         # self.layers = nn.ModuleList(
         #     [LlamaDecoderLayer(config, index=index) for index in range(config.num_hidden_layers)])
@@ -489,14 +489,7 @@ class Model(nn.Module):
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
-        if target_model is None:
-            self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
-        else:
-            self.target_model = target_model
-        self.target_model.eval()
         self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
-        for param in self.target_model.parameters():
-            param.requires_grad = False
 
         if not load_emb:
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
@@ -694,9 +687,9 @@ class Model(nn.Module):
         return combined_attention_mask
 
     @torch.no_grad()
-    def dataprepare(self, input_ids, attention_mask, loss_mask):
+    def dataprepare(self, input_ids, attention_mask, loss_mask, target_model):
         device = input_ids.device
-        outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, past_key_values=None)
+        outs = target_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, past_key_values=None)
         hidden_states0 = outs.hidden_states[0]
         hidden_states1 = outs.hidden_states[1]
         hidden_states2 = outs.hidden_states[2]
@@ -717,6 +710,7 @@ class Model(nn.Module):
             self,
             # hidden_states,
             input_ids,
+            target_model,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -726,7 +720,7 @@ class Model(nn.Module):
             loss_mask: Optional[torch.Tensor] = None,
 
     ):
-        hidden_states, target, loss_mask, input_ids = self.dataprepare(input_ids, attention_mask, loss_mask)
+        hidden_states, target, loss_mask, input_ids = self.dataprepare(input_ids, attention_mask, loss_mask, target_model)
 
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length

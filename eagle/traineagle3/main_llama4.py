@@ -27,7 +27,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType, ShardingStrategy, FullStateDictConfig
 from utils import rank_0_priority
 
-from modeling_llama4_17x16_kv import Llama4ForCausalLM, Llama4TextDecoderLayer
+from modeling_llama4_17x16_kv_tp import Llama4ForCausalLM, Llama4TextDecoderLayer
 from transformers.models.llama4.configuration_llama4 import Llama4TextConfig
 
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -292,57 +292,62 @@ def main():
     print(args)
     init_distributed()
 
-    if dist.get_rank() == 0:
-        init_wandb(args)
+    from comm import create_tp_group
+    tp_size = dist.get_world_size()
+    tp_group = create_tp_group(tp_size)
 
-    # build tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.basepath)
+    # if dist.get_rank() == 0:
+    #     init_wandb(args)
 
-    # build data
-    train_loader, test_loader, train_sampler, test_sampler = prepare_dataloaders(args, tokenizer)
 
     # build model and apply fsdp
     config = EConfig.from_pretrained(args.config_path)
     
     # build target model
-    llama4_config = Llama4TextConfig.from_pretrained(args.basepath)
-    with torch.device("meta"):
+    from accelerate import init_empty_weights
+
+    with init_empty_weights():
+        llama4_config = Llama4TextConfig.from_pretrained(args.basepath)
         target_model = Llama4ForCausalLM(llama4_config).to(torch.bfloat16)
+    number_of_parameters = sum(p.numel() for p in target_model.parameters())
 
-    llama_auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            Llama4TextDecoderLayer,
-        },
-    )
+    if dist.get_rank() == 0:
+        for name, module in target_model.named_modules():
+            module_numel = sum(p.numel() for p in module.parameters())
+            print(f"{name} {module_numel}")
 
-    model = Model(config, path=args.basepath, load_emb=True, load_head=True, target_model=target_model, type="multimodal").to(torch.bfloat16)
+    target_model.to_empty(device=torch.cuda.current_device())
 
-    model = FSDP(
-        model,
+    # build draft model
+    draft_model = Model(config, path=args.basepath, load_emb=True, load_head=True, type="multimodal").to(torch.bfloat16)
+    draft_model = FSDP(
+        draft_model,
         use_orig_params=True,
-        auto_wrap_policy=llama_auto_wrap_policy,     
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         device_id=torch.cuda.current_device(),
     )
     print("finished wrapping fsdp")
 
-    dict = load_checkpoint(args.basepath)
-    
-    # cfg = FullStateDictConfig(rank0_only=True)
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-        model.load_state_dict(dict, strict=False)
-    model = model.cuda()
-    print("finished loading checkpoint")
-    
+    draft_model = draft_model.cuda()
     with rank_0_priority():
-        model.scandata(args.trainpath, args.basepath, user_template, assistant_template)
+        draft_model.scandata(args.trainpath, args.basepath, user_template, assistant_template)
     print("Finished scanning data")
+    
 
+    # load ckpt for target model
+    # dict = load_checkpoint(args.basepath)
+    # target_model = target_model.cuda()
+    # print("finished loading checkpoint")
+
+
+    # build tokenizer and dataloader
+    tokenizer = AutoTokenizer.from_pretrained(args.basepath)
+    train_loader, test_loader, train_sampler, test_sampler = prepare_dataloaders(args, tokenizer)
+    
     # build loss, optimizer, lr scheduler
     criterion = nn.SmoothL1Loss(reduction="none")
     num_epochs = args.num_epochs
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = AdamW(draft_model.parameters(), lr=args.learning_rate)
     total_steps = len(train_loader) * num_epochs
     warmup_steps = int(total_steps * 0.015)
     scheduler = CosineAnnealingWarmupLR(optimizer, total_steps=total_steps, warmup_steps=warmup_steps)
@@ -353,17 +358,18 @@ def main():
     for epoch in range(num_epochs):
         print(f"Now training epoch {epoch}")
         train_sampler.set_epoch(epoch+1)
-        model.train()
-        epoch_acces = [[] for _ in range(model.length)]
-        epoch_plosses = [[] for _ in range(model.length)]
+        draft_model.train()
+        epoch_acces = [[] for _ in range(draft_model.length)]
+        epoch_plosses = [[] for _ in range(draft_model.length)]
 
         for batch_idx, data in enumerate(tqdm(train_loader)):
             optimizer.zero_grad()
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                plosses, vlosses, acces = model(input_ids=data["input_ids"].cuda(),
+                plosses, vlosses, acces = draft_model(input_ids=data["input_ids"].cuda(),
                                                     attention_mask=data["attention_mask"].cuda(),
                                                     loss_mask=data["loss_mask"].cuda(),
+                                                    target_model=target_model,
                                                     )
 
             # calculate ploss
