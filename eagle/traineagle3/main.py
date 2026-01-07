@@ -78,16 +78,16 @@ def build_dataset_rank(
             source = examples['conversations'][i]
             if not source:
                 continue
-            if roles[source[0]["from"]] != "user":
+            if source[0]["role"] != "user":
                 # Skip the first one if it is not from human
                 source = source[1:]
             for j, sentence in enumerate(source):
-                role = roles[sentence["from"]]
+                role = sentence["role"]
                 assert role == convroles[j % 2], f"{i}"
                 # if sentence["from"]=="gpt":
                 #     sentence["value"]=" "+sentence["value"]
                 messages.append(
-                    {"role": role, "content": sentence["value"]}
+                    {"role": role, "content": sentence["content"]}
                 )
             conversation = tokenizer.apply_chat_template(
                 messages,
@@ -220,11 +220,12 @@ model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
 global_rank = deepspeed.comm.get_rank()
 rank = deepspeed.comm.get_local_rank()
 world_size = deepspeed.comm.get_world_size()
-if global_rank == 0:
-    import wandb
 
-    wandb.login(key="")
-    wandb.init(project="l382", entity="yuhui-li", config=ds_config)
+# if global_rank == 0:
+#     import wandb
+
+#     wandb.login(key="")
+#     wandb.init(project="l382", entity="yuhui-li", config=ds_config)
 
 os.makedirs(args.savedir, exist_ok=True)
 
@@ -286,13 +287,13 @@ for epoch in range(start_epoch, num_epochs):
 
         model_engine.step()
 
-        if global_rank == 0:
-            logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"]}
-            for i in range(len(plosses)):
-                logdict[f"train/ploss_{i}"] = plosses[i].item()
-            for i in range(len(acces)):
-                logdict[f"train/acc_{i}"] = acces[i]
-            wandb.log(logdict)
+        # if global_rank == 0:
+        #     logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"]}
+        #     for i in range(len(plosses)):
+        #         logdict[f"train/ploss_{i}"] = plosses[i].item()
+        #     for i in range(len(acces)):
+        #         logdict[f"train/acc_{i}"] = acces[i]
+            # wandb.log(logdict)
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
@@ -302,7 +303,7 @@ for epoch in range(start_epoch, num_epochs):
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
         if global_rank == 0:
-            wandb.log({f"train/epochacc_{i}": acc_i})
+            # wandb.log({f"train/epochacc_{i}": acc_i})
             print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
 
     for i in range(len(epoch_plosses)):
@@ -310,7 +311,7 @@ for epoch in range(start_epoch, num_epochs):
         deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
         loss_i = loss_i.item()
         if global_rank == 0:
-            wandb.log({f"train/epochploss_{i}": loss_i})
+            # wandb.log({f"train/epochploss_{i}": loss_i})
             print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
 
     epoch_acces = [[] for _ in range(model.length)]
@@ -330,7 +331,7 @@ for epoch in range(start_epoch, num_epochs):
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
         if global_rank == 0:
-            wandb.log({f"test/epochacc_{i}": acc_i})
+            # wandb.log({f"test/epochacc_{i}": acc_i})
             print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
 
     for i in range(len(epoch_plosses)):
@@ -338,7 +339,7 @@ for epoch in range(start_epoch, num_epochs):
         deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
         loss_i = loss_i.item()
         if global_rank == 0:
-            wandb.log({f"test/epochploss_{i}": loss_i})
+            # wandb.log({f"test/epochploss_{i}": loss_i})
             print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
 
 

@@ -542,16 +542,16 @@ class Model(nn.Module):
                     source = examples['conversations'][i]
                     if not source:
                         continue
-                    if roles[source[0]["from"]] != "user":
+                    if source[0]["role"] != "user":
                         # Skip the first one if it is not from human
                         source = source[1:]
                     for j, sentence in enumerate(source):
-                        role = roles[sentence["from"]]
+                        role = sentence["role"]
                         assert role == convroles[j % 2], f"{i}"
                         # if sentence["from"]=="gpt":
                         #     sentence["value"]=" "+sentence["value"]
                         messages.append(
-                            {"role": role, "content": sentence["value"]}
+                            {"role": role, "content": sentence["content"]}
                         )
                     conversation = tokenizer.apply_chat_template(
                         messages,
