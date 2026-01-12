@@ -1,2 +1,5 @@
 *.jsonl
 Llama-3.1-8B-Instruct/
+cache.pt
+0/
+wandb/
