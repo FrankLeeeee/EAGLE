@@ -21,7 +21,7 @@ train_config = {
     "bs": ds_config["train_micro_batch_size_per_gpu"],
     "num_epochs": 40,
     "num_workers": 2,
-    "max_len": 2048,
+    "max_len": 4096,
     "config_path": "config.json",
 }
 
@@ -101,7 +101,7 @@ def build_dataset_rank(
             input_ids = tokenizer(
                 conversation,
                 return_tensors="pt",
-                max_length=2048,
+                max_length=4096,
                 add_special_tokens=False,
             ).input_ids[0]
             loss_mask = torch.ones_like(input_ids)
@@ -223,9 +223,7 @@ world_size = deepspeed.comm.get_world_size()
 
 if global_rank == 0:
     import wandb
-
-    wandb.login(key="")
-    wandb.init(project="specforge-debug", name="official-eagle3-deepspeed", config=ds_config)
+    wandb.init(project="specforge-debug", name="official-eagle3-deepspeed-llama3", config=ds_config)
 
 os.makedirs(args.savedir, exist_ok=True)
 

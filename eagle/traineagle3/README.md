@@ -7,7 +7,7 @@ source .venv/bin/activate
 
 # install dependencies
 uv pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
-uv pip install datasets transformers==4.52.4 deepspeed importlib-metadata accelerate
+uv pip install datasets transformers==4.52.4 deepspeed importlib-metadata accelerate wandb
 
 # prepare data
 python prepare_sharegpt.py
