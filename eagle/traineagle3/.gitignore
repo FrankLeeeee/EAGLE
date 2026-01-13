@@ -1,5 +1,6 @@
 *.jsonl
 Llama-3.1-8B-Instruct/
+Llama-3.3-70B-Instruct/
 cache.pt
 0/
 wandb/

@@ -7,12 +7,14 @@ parser.add_argument('--trainpath', type=str,
                     default="/home/lyh/code/nlp/developing/vllmbase/vllm/gedata/l318b.jsonl")
 # parser.add_argument('--testpath', type=str,
 #                     default="/home/lyh/code/nlp/developing/vllmbase/vllm/gedata/0318.json")
+parser.add_argument('--configpath', type=str, default="config.json")
 parser.add_argument('--savedir', type=str, default='0')
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 import json
 import re
+import time
 
 deepspeed_config = args.deepspeed_config
 with open(deepspeed_config) as f:
@@ -22,7 +24,7 @@ train_config = {
     "num_epochs": 40,
     "num_workers": 2,
     "max_len": 4096,
-    "config_path": "config.json",
+    "config_path": args.configpath,
 }
 
 from safetensors import safe_open
@@ -204,8 +206,11 @@ traindataset = build_dataset_rank(tokenizer, args.trainpath)
 # testdataset = build_dataset_rank(tokenizer, args.testpath)
 
 config = EConfig.from_pretrained(train_config["config_path"])
-model = Model(config, path=args.basepath, load_emb=True, load_head=True)
+
+with deepspeed.zero.Init(enabled=ds_config["zero_optimization"]["stage"]==3):
+    model = Model(config, path=args.basepath, load_emb=True, load_head=True)
 model.scandata(args.trainpath, args.basepath)
+model = model.cuda()
 
 
 criterion = nn.SmoothL1Loss(reduction="none")
@@ -221,9 +226,9 @@ global_rank = deepspeed.comm.get_rank()
 rank = deepspeed.comm.get_local_rank()
 world_size = deepspeed.comm.get_world_size()
 
-if global_rank == 0:
-    import wandb
-    wandb.init(project="specforge-debug", name="official-eagle3-deepspeed-llama3", config=ds_config)
+# if global_rank == 0:
+#     import wandb
+#     wandb.init(project="specforge-debug", name="official-eagle3-deepspeed-llama3", config=ds_config)
 
 os.makedirs(args.savedir, exist_ok=True)
 
@@ -253,9 +258,9 @@ def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
 
 
 checkpoint_path, start_epoch = find_max_state_with_file(args.savedir)
-if checkpoint_path:
-    print(f"load from {checkpoint_path}")
-    model_engine.load_checkpoint(checkpoint_path)
+# if checkpoint_path:
+#     print(f"load from {checkpoint_path}")
+#     model_engine.load_checkpoint(checkpoint_path)
 
 
 
@@ -266,9 +271,14 @@ for epoch in range(start_epoch, num_epochs):
     model.train()
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
-
+    global_step = 0
 
     for batch_idx, data in enumerate(tqdm(train_loader)):
+        global_step += 1
+
+        if global_step == 11:
+            torch.cuda.synchronize()
+            start_time = time.time()
 
         model.zero_grad()
 
@@ -281,36 +291,40 @@ for epoch in range(start_epoch, num_epochs):
         ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
         loss = ploss
         model_engine.backward(loss)
-
-
         model_engine.step()
 
-        if global_rank == 0:
-            logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"]}
-            for i in range(len(plosses)):
-                logdict[f"train/ploss_{i}"] = plosses[i].item()
-            for i in range(len(acces)):
-                logdict[f"train/acc_{i}"] = acces[i]
-            wandb.log(logdict)
-        epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
-        epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
+        if global_step == 50:
+            torch.cuda.synchronize()
+            end_time = time.time()
+            print(f"Time taken: {end_time - start_time} seconds, average time per step: {(end_time - start_time) / 40} seconds")
+            exit()
+
+        # if global_rank == 0:
+        #     logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"]}
+        #     for i in range(len(plosses)):
+        #         logdict[f"train/ploss_{i}"] = plosses[i].item()
+        #     for i in range(len(acces)):
+        #         logdict[f"train/acc_{i}"] = acces[i]
+        #     wandb.log(logdict)
+        # epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
+        # epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
 
-    for i in range(len(epoch_acces)):
-        acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
-        deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
-        acc_i = acc_i.item()
-        if global_rank == 0:
-            wandb.log({f"train/epochacc_{i}": acc_i})
-            print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
+    # for i in range(len(epoch_acces)):
+    #     acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+    #     deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
+    #     acc_i = acc_i.item()
+    #     if global_rank == 0:
+    #         wandb.log({f"train/epochacc_{i}": acc_i})
+    #         print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
 
-    for i in range(len(epoch_plosses)):
-        loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
-        deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
-        loss_i = loss_i.item()
-        if global_rank == 0:
-            wandb.log({f"train/epochploss_{i}": loss_i})
-            print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
+    # for i in range(len(epoch_plosses)):
+    #     loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
+    #     deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
+    #     loss_i = loss_i.item()
+    #     if global_rank == 0:
+    #         wandb.log({f"train/epochploss_{i}": loss_i})
+    #         print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
 
     # epoch_acces = [[] for _ in range(model.length)]
     # epoch_plosses = [[] for _ in range(model.length)]
@@ -341,6 +355,6 @@ for epoch in range(start_epoch, num_epochs):
     #         print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
 
 
-    model_engine.save_16bit_model(f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)
-    if epoch % 10 == 0:
-        deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.savedir}/state_{epoch}")
+    # model_engine.save_16bit_model(f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)
+    # if epoch % 10 == 0:
+    #     deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.savedir}/state_{epoch}")

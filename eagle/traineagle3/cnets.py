@@ -478,7 +478,10 @@ class Model(nn.Module):
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
-        self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+
+        from transformers import AutoConfig
+        target_config = AutoConfig.from_pretrained(path, torch_dtype=torch.float16)
+        self.target_model = LlamaForCausalLM(config=target_config)
         self.target_model.eval()
         self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
         for param in self.target_model.parameters():
