@@ -3,8 +3,10 @@ huggingface-cli download meta-llama/Llama-3.3-70B-Instruct --local-dir ./Llama-3
 deepspeed \
     --num_gpus 8 \
     main.py \
-    --basepath ./Llama-3.3-70B-Instruct \
+    --basepath ~/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe/ \
     --trainpath sharegpt_expanded.jsonl \
     --deepspeed \
     --deepspeed_config ds_config.json \
-    --configpath llama3_70b.json
+    --configpath qwen3_30b_a3b.json \
+    --template qwen
+

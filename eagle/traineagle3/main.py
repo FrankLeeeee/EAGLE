@@ -1,5 +1,6 @@
 import argparse
 import deepspeed
+import re
 
 parser = argparse.ArgumentParser(description='sp')
 parser.add_argument('--basepath', type=str, default='/home/lyh/weights/hf/llama31chat/8B/')
@@ -10,6 +11,8 @@ parser.add_argument('--trainpath', type=str,
 parser.add_argument('--configpath', type=str, default="config.json")
 parser.add_argument('--savedir', type=str, default='0')
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
+parser.add_argument("--template", type=str, choices=["llama", "qwen"], default="llama")
+
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 import json
@@ -54,7 +57,7 @@ from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmu
 
 
 def build_dataset_rank(
-        tokenizer, datapath
+        tokenizer, datapath, template
 ):
 
     ds = load_dataset('json', data_files=datapath)
@@ -62,7 +65,7 @@ def build_dataset_rank(
     ds = ds.shuffle(seed=42)
     ds1 = ds
     original_columns1 = ds1.column_names
-    num_proc = 8
+    num_proc = 64
 
     def preprocess_function(examples):
         new_examples = {
@@ -109,51 +112,51 @@ def build_dataset_rank(
             loss_mask = torch.ones_like(input_ids)
             # print(i)
 
-            sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            if template == "llama":
+                assistant_message_separator = "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                end_of_turn_token = "<|eot_id|>"
+            else:
+                assistant_message_separator = "<|im_start|>assistant\n"
+                end_of_turn_token = "<|im_end|>\n"
 
-            total_len = len(input_ids)
+            assistant_pattern = (
+                        re.escape(assistant_message_separator)
+                        + r"([\s\S]*?(?:"
+                        + re.escape(end_of_turn_token)
+                        + "|$))"
+                    )
 
-            sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-            turns = conversation.split(sep2)
+            # get input_ids
+            loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
+            for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
+                content_start_char = match.start(1)
+                content_end_char = match.end(1)
 
-            turns[1] = turns[0] + sep2 + turns[1]
-            turns = turns[1:]
+                # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
+                # Encode the text "assistant start", the length of which is the position of the starting token.
+                prefix_ids = tokenizer.encode(
+                    conversation[:content_start_char], add_special_tokens=False
+                )
+                # Encodes the text "assistant end", the length of which is the position of the end token.
+                full_ids = tokenizer.encode(
+                    conversation[:content_end_char], add_special_tokens=False
+                )
 
-            cur_len = 1
-            loss_mask[:cur_len] = 0
-            for i, turn in enumerate(turns):
-                if turn == "":
-                    break
-                turn_len = len(tokenizer(turn).input_ids)
+                start_token_idx = len(prefix_ids)
+                end_token_idx = len(full_ids)
 
-                parts = turn.split(sep)
-                if len(parts) != 2:
-                    break
-                parts[0] += sep
-                # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+                # Handling out-of-bounds errors caused by truncation
+                actual_start = min(start_token_idx, len(input_ids))
+                actual_end = min(end_token_idx, len(input_ids))
 
-                # Ignore the user instructions
-                if i == 0:
-                    loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-                else:
-                    loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                cur_len += turn_len
-                if i != 0:
-                    cur_len += 3
-                # cur_len+=2
+                if actual_start < actual_end:
+                    loss_mask[actual_start:actual_end] = 1
 
-                # if i != 0 and not tokenizer.legacy:
-                #     # The legacy and non-legacy modes handle special tokens differently
-                #     cur_len -= 1
-
-            loss_mask[cur_len:] = 0
-            attention_mask = torch.ones_like(loss_mask)
 
             # new_examples["conversation"].append(conversation)
             new_examples["input_ids"].append(input_ids[None, :])
             new_examples["loss_mask"].append(loss_mask[None, :])
-            new_examples["attention_mask"].append(attention_mask[None, :])
+            new_examples["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
 
         return new_examples
 
@@ -162,7 +165,6 @@ def build_dataset_rank(
         batched=True,
         num_proc=num_proc,
         remove_columns=original_columns1,
-        load_from_cache_file=False
     )
 
 
@@ -201,16 +203,21 @@ class DataCollatorWithPadding:
         return batch
 
 
-tokenizer = AutoTokenizer.from_pretrained(args.basepath)
-traindataset = build_dataset_rank(tokenizer, args.trainpath)
-# testdataset = build_dataset_rank(tokenizer, args.testpath)
-
 config = EConfig.from_pretrained(train_config["config_path"])
 
-with deepspeed.zero.Init(enabled=ds_config["zero_optimization"]["stage"]==3):
-    model = Model(config, path=args.basepath, load_emb=True, load_head=True)
-model.scandata(args.trainpath, args.basepath)
-model = model.cuda()
+from contextlib import nullcontext
+
+print(f"Running with zero stage {ds_config['zero_optimization']['stage']}")
+is_stage_3 = ds_config["zero_optimization"]["stage"] == 3
+with nullcontext() if not is_stage_3 else deepspeed.zero.Init():
+    model = Model(config, path=args.basepath, load_emb=True, load_head=True, use_pretrained_weights=not is_stage_3)
+model.scandata(args.trainpath, args.basepath, args.template)
+
+tokenizer = AutoTokenizer.from_pretrained(args.basepath)
+traindataset = build_dataset_rank(tokenizer, args.trainpath, args.template)
+print(f"Finished building data set. ")
+# testdataset = build_dataset_rank(tokenizer, args.testpath)
+
 
 
 criterion = nn.SmoothL1Loss(reduction="none")
@@ -221,6 +228,7 @@ model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
                                                      model=model,
                                                      model_parameters=model.parameters(),
                                                      )
+model = model.cuda()
 
 global_rank = deepspeed.comm.get_rank()
 rank = deepspeed.comm.get_local_rank()

@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
+import re
 import os
 
 from transformers.activations import ACT2FN
@@ -34,6 +35,7 @@ from configs import EConfig
 from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
+from transformers import AutoModelForCausalLM
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -466,7 +468,7 @@ def merge_dicts(dicts):
         result.update(d)
     return result
 class Model(nn.Module):
-    def __init__(self, config, load_head=False, load_emb=True, path=None):
+    def __init__(self, config, load_head=False, load_emb=True, path=None, use_pretrained_weights=False):
         super().__init__()
         # self.layers = nn.ModuleList(
         #     [LlamaDecoderLayer(config, index=index) for index in range(config.num_hidden_layers)])
@@ -479,9 +481,12 @@ class Model(nn.Module):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
 
-        from transformers import AutoConfig
-        target_config = AutoConfig.from_pretrained(path, torch_dtype=torch.float16)
-        self.target_model = LlamaForCausalLM(config=target_config)
+        if use_pretrained_weights:
+            self.target_model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+        else:
+            from transformers import AutoConfig
+            target_config = AutoConfig.from_pretrained(path, torch_dtype=torch.float16)
+            self.target_model = AutoModelForCausalLM.from_config(target_config)
         self.target_model.eval()
         self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
         for param in self.target_model.parameters():
@@ -518,7 +523,7 @@ class Model(nn.Module):
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
 
-    def scandata(self, datapath, tokenizerpath):
+    def scandata(self, datapath, tokenizerpath, template):
         N = self.draft_vocab_size
         if not os.path.exists("cache.pt"):
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
@@ -526,19 +531,18 @@ class Model(nn.Module):
             dataset = dataset['train']
             # dataset = dataset.select(range(96))
             original_columns1 = dataset.column_names
-            num_proc = 48
+            num_proc = 64
 
 
             def preprocess_function(examples):
                 new_examples = {
-                    # "conversation": [],
                     "input_ids": [],
                     "loss_mask": []
                 }
                 for i in range(len(examples['id'])):
                     messages = [
                         {"role": "system",
-                         "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
+                        "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
                     ]
                     convroles = ["user", "assistant"]
                     roles = {"human": "user", "gpt": "assistant"}
@@ -568,51 +572,52 @@ class Model(nn.Module):
                     input_ids = tokenizer(
                         conversation,
                         return_tensors="pt",
-                        max_length=2048,
+                        max_length=4096,
                         add_special_tokens=False,
                     ).input_ids[0]
                     loss_mask = torch.ones_like(input_ids)
                     # print(i)
 
-                    sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                    if template == "llama":
+                        assistant_message_separator = "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                        end_of_turn_token = "<|eot_id|>"
+                    else:
+                        assistant_message_separator = "<|im_start|>assistant\n"
+                        end_of_turn_token = "<|im_end|>\n"
 
-                    total_len = len(input_ids)
+                    assistant_pattern = (
+                                re.escape(assistant_message_separator)
+                                + r"([\s\S]*?(?:"
+                                + re.escape(end_of_turn_token)
+                                + "|$))"
+                            )
 
-                    sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-                    turns = conversation.split(sep2)
+                    # get input_ids
+                    loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
+                    for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
+                        content_start_char = match.start(1)
+                        content_end_char = match.end(1)
 
-                    turns[1] = turns[0] + sep2 + turns[1]
-                    turns = turns[1:]
+                        # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
+                        # Encode the text "assistant start", the length of which is the position of the starting token.
+                        prefix_ids = tokenizer.encode(
+                            conversation[:content_start_char], add_special_tokens=False
+                        )
+                        # Encodes the text "assistant end", the length of which is the position of the end token.
+                        full_ids = tokenizer.encode(
+                            conversation[:content_end_char], add_special_tokens=False
+                        )
 
-                    cur_len = 1
-                    loss_mask[:cur_len] = 0
-                    for i, turn in enumerate(turns):
-                        if turn == "":
-                            break
-                        turn_len = len(tokenizer(turn).input_ids)
+                        start_token_idx = len(prefix_ids)
+                        end_token_idx = len(full_ids)
 
-                        parts = turn.split(sep)
-                        if len(parts) != 2:
-                            break
-                        parts[0] += sep
-                        # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                        instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+                        # Handling out-of-bounds errors caused by truncation
+                        actual_start = min(start_token_idx, len(input_ids))
+                        actual_end = min(end_token_idx, len(input_ids))
 
-                        # Ignore the user instructions
-                        if i == 0:
-                            loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-                        else:
-                            loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                        cur_len += turn_len
-                        if i != 0:
-                            cur_len += 3
-                        # cur_len+=2
+                        if actual_start < actual_end:
+                            loss_mask[actual_start:actual_end] = 1
 
-                        # if i != 0 and not tokenizer.legacy:
-                        #     # The legacy and non-legacy modes handle special tokens differently
-                        #     cur_len -= 1
-
-                    loss_mask[cur_len:] = 0
 
                     # new_examples["conversation"].append(conversation)
                     new_examples["input_ids"].append(input_ids[None, :])
@@ -625,7 +630,6 @@ class Model(nn.Module):
                 batched=True,
                 num_proc=num_proc,
                 remove_columns=original_columns1,
-                load_from_cache_file=False
             )
             #dataset.set_format(type="torch")
 
@@ -694,10 +698,43 @@ class Model(nn.Module):
     @torch.no_grad()
     def dataprepare(self, input_ids, attention_mask, loss_mask):
         device = input_ids.device
+
+        captured_states = {}
+        handles = []
+
+        def get_hook(layer_idx):
+            def hook(module, input, output):
+                # HF outputs for layers are usually tuples (hidden_states, present_key_value, ...)
+                # We only need the hidden_states (first element)
+                if isinstance(output, tuple):
+                    hidden = output[0]
+                else:
+                    hidden = output
+                captured_states[layer_idx] = hidden
+
+            return hook
+        
+        # Locate the transformer layers ModuleList
+        layers = self._get_transformer_layers()
+        target_indices = [5, 10, 15]
+
+        for idx in target_indices:
+            # Ensure index is within bounds
+            if 0 <= idx < len(layers):
+                handles.append(layers[idx].register_forward_hook(get_hook(idx)))
+            else:
+                raise ValueError(
+                    f"Layer index {idx} out of bounds for model with {len(layers)} layers."
+                )
+
         outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states0 = outs.hidden_states[0]
-        hidden_states1 = outs.hidden_states[1]
-        hidden_states2 = outs.hidden_states[2]
+
+        for handle in handles:
+            handle.remove()
+        
+        hidden_states0 = captured_states[target_indices[0]]
+        hidden_states1 = captured_states[target_indices[1]]
+        hidden_states2 = captured_states[target_indices[2]]
         hidden_states=torch.cat((hidden_states0,hidden_states1,hidden_states2),dim=-1)
         # hidden_states=torch.cat((hidden_states0,hidden_states1),dim=-1)
         target = outs.logits
@@ -710,6 +747,20 @@ class Model(nn.Module):
             loss_mask = loss_mask.to(device)
 
         return hidden_states, target, loss_mask, input_ids
+
+    def _get_transformer_layers(self):
+        if hasattr(self.target_model, "model") and hasattr(self.target_model.model, "layers"):
+            return self.target_model.model.layers
+        elif hasattr(self.target_model, "layers"):
+            return self.target_model.layers
+        elif hasattr(self.target_model, "transformer") and hasattr(
+            self.target_model.transformer, "h"
+        ):
+            return self.target_model.transformer.h
+        else:
+            raise ValueError(
+                "Could not locate transformer layers in the model architecture to register hooks."
+            )
 
     def forward(
             self,
