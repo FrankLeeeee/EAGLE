@@ -6,5 +6,5 @@ deepspeed \
     --basepath ./Llama-3.3-70B-Instruct \
     --trainpath sharegpt_expanded.jsonl \
     --deepspeed \
-    --deepspeed_config ds_config.json \
+    --deepspeed_config ds_config_stage3.json \
     --configpath llama3_70b.json

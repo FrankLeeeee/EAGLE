@@ -1,3 +1,5 @@
+huggingface-cli download meta-llama/Llama-3.1-8B-Instruct --local-dir ./Llama-3.1-8B-Instruct
+
 deepspeed \
         --num_gpus 8 \
         main.py \
